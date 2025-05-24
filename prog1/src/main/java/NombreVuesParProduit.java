@@ -9,7 +9,7 @@ import org.apache.hadoop.mapreduce.Reducer;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 
-public class ProductViewCounter {
+public class NombreVuesParProduit {
 
     // Mapper class
     public static class VuesMapper extends Mapper<Object, Text, Text, IntWritable> {
