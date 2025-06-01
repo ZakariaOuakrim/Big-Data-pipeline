@@ -1,20 +1,22 @@
-version: '3'
+version: '3.8'
+
 services:
+  # HDFS and Hadoop Services
   namenode:
     image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
     container_name: namenode
     restart: always
     ports:
-      - 9870:9870
-      - 9000:9000
+      - "9870:9870"
+      - "9000:9000"
     volumes:
       - hadoop_namenode:/hadoop/dfs/name
     environment:
       - CLUSTER_NAME=hadoop-cluster
       - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
     networks:
-      - hadoop-network
-      
+      - bigdata-network
+
   datanode:
     image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
     container_name: datanode
@@ -26,22 +28,22 @@ services:
     depends_on:
       - namenode
     networks:
-      - hadoop-network
-      
+      - bigdata-network
+
   resourcemanager:
     image: bde2020/hadoop-resourcemanager:2.0.0-hadoop3.2.1-java8
     container_name: resourcemanager
     restart: always
     ports:
-      - 8088:8088
+      - "8089:8088"  # Changed port to avoid conflict with Superset
     environment:
       - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
     depends_on:
       - namenode
       - datanode
     networks:
-      - hadoop-network
-      
+      - bigdata-network
+
   nodemanager:
     image: bde2020/hadoop-nodemanager:2.0.0-hadoop3.2.1-java8
     container_name: nodemanager
@@ -53,14 +55,14 @@ services:
       - datanode
       - resourcemanager
     networks:
-      - hadoop-network
-      
+      - bigdata-network
+
   historyserver:
     image: bde2020/hadoop-historyserver:2.0.0-hadoop3.2.1-java8
     container_name: historyserver
     restart: always
     ports:
-      - 8188:8188
+      - "8188:8188"
     environment:
       - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
     depends_on:
@@ -70,118 +72,140 @@ services:
     volumes:
       - hadoop_historyserver:/hadoop/yarn/timeline
     networks:
-      - hadoop-network
-      
-  client:
+      - bigdata-network
+
+  # Hadoop Client for running MapReduce jobs
+  hadoop-client:
     image: bde2020/hadoop-base:2.0.0-hadoop3.2.1-java8
     container_name: hadoop-client
-    entrypoint: ["tail", "-f", "/dev/null"]
+    entrypoint: |
+      bash -c "
+        echo 'Waiting for HDFS to be ready...'
+        sleep 30
+        echo 'Creating HDFS directories...'
+        hdfs dfs -mkdir -p /user/hive/warehouse
+        hdfs dfs -mkdir -p /projet_logs
+        hdfs dfs -chmod 777 /user/hive/warehouse
+        hdfs dfs -chmod 777 /user/hive
+        hdfs dfs -chmod 777 /projet_logs
+        echo 'HDFS directories created successfully'
+        tail -f /dev/null
+      "
     environment:
       - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
     volumes:
-      - ./target:/app
+      - ./data:/data
+      - ./mapreduce-jobs:/mapreduce
     depends_on:
       - namenode
       - datanode
       - resourcemanager
       - nodemanager
     networks:
-      - hadoop-network
+      - bigdata-network
 
-  # PostgreSQL database for Hive Metastore and Superset
+  # Database for Hive Metastore
   postgres:
     image: postgres:13
+    restart: unless-stopped
     container_name: postgres
-    restart: always
-    ports:
-      - 5432:5432
+    hostname: postgres
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=metastore
+      POSTGRES_DB: 'metastore_db'
+      POSTGRES_USER: 'hive'
+      POSTGRES_PASSWORD: 'password'
+    ports:
+      - '5432:5432'
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+      - hive-db:/var/lib/postgresql/data
     networks:
-      - hadoop-network
+      - bigdata-network
 
-  # Hive Metastore
-  hive-metastore:
-    image: bde2020/hive:2.3.2-postgresql-metastore
-    container_name: hive-metastore
-    restart: always
-    ports:
-      - 9083:9083
-    environment:
-      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
-      - SERVICE_PRECONDITION=namenode:9870 datanode:9864 postgres:5432
+  # Hive Metastore Service
+  metastore:
+    image: apache/hive:${HIVE_VERSION:-4.0.0}
     depends_on:
-      - namenode
-      - datanode
       - postgres
-    networks:
-      - hadoop-network
-
-  # Hive Server
-  hive-server:
-    image: bde2020/hive:2.3.2-postgresql-metastore
-    container_name: hive-server
-    restart: always
-    ports:
-      - 10000:10000
-      - 10002:10002
+      - namenode
+      - hadoop-client
+    restart: unless-stopped
+    container_name: metastore
+    hostname: metastore
     environment:
-      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
-      - HIVE_CORE_CONF_javax_jdo_option_ConnectionURL=jdbc:postgresql://postgres:5432/metastore
-      - SERVICE_PRECONDITION=hive-metastore:9083
-    depends_on:
-      - hive-metastore
-    networks:
-      - hadoop-network
-
-  # Redis for Superset caching
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    restart: always
+      DB_DRIVER: postgres
+      SERVICE_NAME: 'metastore'
+      SERVICE_OPTS: >
+        -Xmx1G
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore_db
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=password
+        -Dhive.metastore.warehouse.dir=hdfs://namenode:9000/user/hive/warehouse
+        -Dhive.security.authorization.enabled=false
+        -Dhive.metastore.authorization.storage.checks=false
     ports:
-      - 6379:6379
+      - '9083:9083'
+    volumes:
+      - warehouse:/opt/hive/data/warehouse
+      - type: bind
+        source: ./postgresql-42.5.0.jar
+        target: /opt/hive/lib/postgres.jar
     networks:
-      - hadoop-network
+      - bigdata-network
 
-  # Apache Superset
+  # Hive Server2
+  hiveserver2:
+    image: apache/hive:${HIVE_VERSION:-4.0.0}
+    depends_on:
+      - metastore
+      - namenode
+      - hadoop-client
+    restart: unless-stopped
+    container_name: hiveserver2
+    environment:
+      HIVE_SERVER2_THRIFT_PORT: 10000
+      SERVICE_OPTS: >
+        -Xmx1G 
+        -Dhive.metastore.uris=thrift://metastore:9083
+        -Dhive.metastore.warehouse.dir=hdfs://namenode:9000/user/hive/warehouse
+        -Dhive.security.authorization.enabled=false
+        -Dhive.metastore.authorization.storage.checks=false
+      IS_RESUME: 'true'
+      SERVICE_NAME: 'hiveserver2'
+    ports:
+      - '10000:10000'
+      - '10002:10002'
+    volumes:
+      - warehouse:/opt/hive/data/warehouse
+    networks:
+      - bigdata-network
+
+# Apache Superset for Data Visualization
   superset:
     image: apache/superset:latest
     container_name: superset
-    restart: always
+    restart: unless-stopped
     ports:
-      - 8089:8088
+      - "8088:8088"
     environment:
-      - SUPERSET_CONFIG_PATH=/app/superset_config.py
-      - SUPERSET_SECRET_KEY=your-secret-key-change-this
+      SUPERSET_SECRET_KEY: 'thisISaSECRET_key'
+      SUPERSET_CONFIG_PATH: /app/superset_config.py
     volumes:
-      - superset_data:/app/superset_home
+      - superset_home:/app/superset_home
       - ./superset_config.py:/app/superset_config.py
     depends_on:
-      - postgres
-      - redis
+      - hiveserver2
     networks:
-      - hadoop-network
-    command: >
-      bash -c "
-      superset db upgrade &&
-      superset fab create-admin --username admin --firstname Admin --lastname User --email admin@superset.com --password admin &&
-      superset init &&
-      superset run -h 0.0.0.0 -p 8088 --with-threads --reload --debugger
-      "
-      
-networks:
-  hadoop-network:
-    driver: bridge
-    
+      - bigdata-network
+
 volumes:
   hadoop_namenode:
   hadoop_datanode:
   hadoop_historyserver:
-  postgres_data:
-  superset_data:
+  hive-db:
+  warehouse:
+  superset_home:
+
+networks:
+  bigdata-network:
+    driver: bridge
